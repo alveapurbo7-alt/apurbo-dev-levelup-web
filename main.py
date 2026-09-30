@@ -13,11 +13,6 @@ import itertools
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
-# Anchor every relative file/subprocess path to this script's own folder —
-# a bot launched via systemd/pm2/cron/docker rarely has cwd == script folder,
-# and a bare "cs.py" resolves against cwd, not this file's location.
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 if sys.platform == "win32":
     try:
         if hasattr(sys.stdout, 'reconfigure'):
@@ -40,7 +35,7 @@ from dashboard_server import bot_state, start_web_dashboard
 
 # ==================== CONFIGURATION ====================
 WEB_HOST = "0.0.0.0"
-WEB_PORT = 3000
+WEB_PORT = 20335
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"  # 🔥 NEW: Persistent device storage
@@ -483,7 +478,6 @@ async def get_playstore_version():
 
 async def version_config():
     app_version = await get_playstore_version()
-    print_info(f"[VERSION_CFG] Play Store version = {app_version}")
     api_url = (
         "https://version.ggwhitehawk.com/live/ver.php"
         f"?version={app_version}"
@@ -493,24 +487,15 @@ async def version_config():
     )
     try:
         response = await client.get(api_url)
-        print_info(f"[VERSION_CFG] HTTP {response.status_code} | URL: {api_url}")
-        if response.status_code != 200:
-            print_error(f"[VERSION_CFG] Non-200 response body: {response.text[:500]}")
-            return None
+        response.raise_for_status()
         data = response.json()
-        print_info(f"[VERSION_CFG] RAW JSON: {json.dumps(data)[:600]}")
         server_url = data.get("server_url")
         remote_version = data.get("remote_version")
         latest_release_version = data.get("latest_release_version")
         if not server_url or not remote_version or not latest_release_version:
-            print_error(f"[VERSION_CFG] Missing fields → server_url={server_url} | remote_version={remote_version} | latest={latest_release_version}")
             return None
-        print_success(f"[VERSION_CFG] OK → release={latest_release_version} | remote={remote_version} | server={server_url}")
         return latest_release_version, remote_version, server_url
-    except Exception as e:
-        import traceback
-        print_error(f"[VERSION_CFG] EXCEPTION: {e}")
-        traceback.print_exc()
+    except Exception:
         return None
 
 async def get_access_token(uid, password):
@@ -533,33 +518,18 @@ async def get_access_token(uid, password):
     for attempt in range(5):
         try:
             response = await client.post(url, headers=hdrs, data=data)
-            print_info(f"[OAUTH] Attempt {attempt+1}/5 → HTTP {response.status_code} | URL: {url}")
-            body = response.text
-            print_info(f"[OAUTH] RAW BODY: {body[:600]}")
             if response.status_code == 200:
-                try:
-                    response_data = response.json()
-                except Exception as je:
-                    print_error(f"[OAUTH] JSON decode failed: {je}")
-                    await asyncio.sleep(0.5)
-                    continue
+                response_data = response.json()
                 open_id = response_data.get("open_id")
                 access_token = response_data.get("access_token")
                 platform = response_data.get("platform", 4)
                 if open_id and access_token:
-                    print_success(f"[OAUTH] OK → open_id={open_id[:12]}... | platform={platform}")
                     return open_id, access_token, platform
-                print_error(f"[OAUTH] Missing tokens in body: {response_data}")
-            elif response.status_code == 429:
-                print_warning("[OAUTH] Rate limited (429), retrying...")
+            if response.status_code == 429:
                 await asyncio.sleep(1)
                 continue
-            else:
-                print_error(f"[OAUTH] Non-200 → status={response.status_code} | body={body[:500]}")
-        except Exception as e:
-            import traceback
-            print_error(f"[OAUTH] EXCEPTION: {e}")
-            traceback.print_exc()
+        except Exception:
+            pass
         await asyncio.sleep(0.5)
     return None
 
@@ -591,7 +561,6 @@ async def build_majorlogin_payload(open_id, access_token, platform, client_versi
         proto.platform_id = 1 if str(platform) in ["1", "4"] else int(platform)
         proto.client_version = client_version
         proto.client_version_code = "2019121229"
-        # Note: keep code as-is; client_version string is what server validates
         
         # --- INJECTING PERSISTENT DYNAMIC DEVICE DATA ---
         proto.system_software = device_info.get("system_software", "Android OS 12 / API-31 (SP1A.210812.016.C2/user.dxu.20260701.180839)")
@@ -662,33 +631,12 @@ async def send_majorlogin(data, release_version, server_url):
         url = f"{server_url}MajorLogin"
         req_headers = headers.copy()
         req_headers["ReleaseVersion"] = release_version
-        print_info(f"[MAJORLOGIN] POST → {url}")
-        print_info(f"[MAJORLOGIN] ReleaseVersion={release_version} | payload_size={len(data)} bytes")
         response = await client.post(url, headers=req_headers, data=data)
-        print_info(f"[MAJORLOGIN] HTTP {response.status_code} | resp_len={len(response.content)} bytes")
         if response.status_code != 200:
-            print_error(f"[MAJORLOGIN] Non-200 → status={response.status_code}")
-            try:
-                print_error(f"[MAJORLOGIN] RAW BODY (first 800): {response.text[:800]}")
-            except Exception:
-                print_error(f"[MAJORLOGIN] RAW HEX (first 200): {response.content[:200].hex()}")
             return None
         response_content = response.content
-        print_info(f"[MAJORLOGIN] FULL HEX ({len(response_content)} bytes): {response_content.hex()}")
-        print_info(f"[MAJORLOGIN] Content-Type: {response.headers.get('Content-Type')} | Server: {response.headers.get('Server')} | Date: {response.headers.get('Date')}")
         if len(response_content) < 40:
-            print_error(f"[MAJORLOGIN] Response too short ({len(response_content)} bytes)")
             return None
-            
-                    # DEBUG: Dump response to file for inspection
-        try:
-            with open("majorlogin_response.bin", "wb") as f:
-                f.write(response_content)
-            with open("majorlogin_request.bin", "wb") as f:
-                f.write(data)
-            print_info(f"[MAJORLOGIN] Saved request/response to .bin files")
-        except Exception:
-            pass
 
         # 1. Direct parse
         res_proto = thunderFF_pb2.MajorLoginRes()
@@ -732,19 +680,10 @@ async def send_getlogin(data, base_url, token, release_version):
         req_headers["ReleaseVersion"] = release_version
         req_headers['Authorization'] = f"Bearer {token}"
         req_headers['Host'] = "clientbp.ppmainecoonghj.com"
-        print_info(f"[GETLOGIN] POST → {url}")
-        print_info(f"[GETLOGIN] Token (first 20): {token[:20]}... | payload_size={len(data)} bytes")
         response = await client.post(url, headers=req_headers, data=data)
-        print_info(f"[GETLOGIN] HTTP {response.status_code} | resp_len={len(response.content)} bytes")
         if response.status_code != 200:
-            print_error(f"[GETLOGIN] Non-200 → status={response.status_code}")
-            try:
-                print_error(f"[GETLOGIN] RAW BODY (first 800): {response.text[:800]}")
-            except Exception:
-                print_error(f"[GETLOGIN] RAW HEX (first 200): {response.content[:200].hex()}")
             return None
         response_content = response.content
-        print_info(f"[GETLOGIN] FIRST 64 BYTES: {response_content[:64].hex()}")
 
         res_proto = thunderFF_pb2.GetLoginDataRes()
         parsed_successfully = False
@@ -819,243 +758,6 @@ async def start_game_lone_wolf(region, client_version, writer, key, iv):
     final_packet = "031400" + "0" * (6 - len(hex_length)) + hex_length + encrypted_packet
     writer.write(bytes.fromhex(final_packet))
     await writer.drain()
-
-
-# ==================== CLASH SQUAD (CS) SOLO MATCHMAKING ====================
-async def _cs_enc_varint(n):
-    out = bytearray()
-    while True:
-        b = n & 0x7F
-        n >>= 7
-        if n:
-            b |= 0x80
-        out.append(b)
-        if not n:
-            break
-    return bytes(out)
-
-
-class _Fixed64:
-    """Wrapper so _cs_build_proto knows to emit wire type 1 (fixed64)."""
-    __slots__ = ("value",)
-    def __init__(self, value: int):
-        self.value = value & 0xFFFFFFFFFFFFFFFF
-
-
-async def _cs_build_proto(fields):
-    packet = bytearray()
-    for field, value in fields.items():
-        # 🔥 LIST support (repeated fields)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    nested = await _cs_build_proto(item)
-                    packet.extend(await _cs_enc_varint((field << 3) | 2))
-                    packet.extend(await _cs_enc_varint(len(nested)))
-                    packet.extend(nested)
-                elif isinstance(item, _Fixed64):
-                    packet.extend(await _cs_enc_varint((field << 3) | 1))
-                    packet.extend(struct.pack("<Q", item.value))
-                elif isinstance(item, int):
-                    packet.extend(await _cs_enc_varint((field << 3) | 0))
-                    packet.extend(await _cs_enc_varint(item))
-                elif isinstance(item, (str, bytes)):
-                    enc_item = item.encode() if isinstance(item, str) else item
-                    packet.extend(await _cs_enc_varint((field << 3) | 2))
-                    packet.extend(await _cs_enc_varint(len(enc_item)))
-                    packet.extend(enc_item)
-        elif isinstance(value, dict):
-            nested = await _cs_build_proto(value)
-            packet.extend(await _cs_enc_varint((field << 3) | 2))
-            packet.extend(await _cs_enc_varint(len(nested)))
-            packet.extend(nested)
-        elif isinstance(value, _Fixed64):
-            packet.extend(await _cs_enc_varint((field << 3) | 1))
-            packet.extend(struct.pack("<Q", value.value))
-        elif isinstance(value, int):
-            packet.extend(await _cs_enc_varint((field << 3) | 0))
-            packet.extend(await _cs_enc_varint(value))
-        elif isinstance(value, (str, bytes)):
-            encoded = value.encode() if isinstance(value, str) else value
-            packet.extend(await _cs_enc_varint((field << 3) | 2))
-            packet.extend(await _cs_enc_varint(len(encoded)))
-            packet.extend(encoded)
-    return bytes(packet)
-
-
-async def _cs_generate_packet(proto_hex, prefix, key, iv):
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    encrypted = cipher.encrypt(pad(bytes.fromhex(proto_hex), 16)).hex()
-    length = len(encrypted) // 2
-    length_hex = hex(length)[2:]
-    if len(length_hex) == 2:
-        header = prefix + "000000"
-    elif len(length_hex) == 3:
-        header = prefix + "00000"
-    elif len(length_hex) == 4:
-        header = prefix + "0000"
-    elif len(length_hex) == 5:
-        header = prefix + "000"
-    else:
-        raise ValueError(f"[CS] Unexpected length hex: {length_hex}")
-    return bytes.fromhex(header + length_hex + encrypted)
-
-
-async def start_game_clash_squad(region, writer, key, iv):
-    """Send CS Solo Matchmaking packet directly from decrypted capture hex."""
-    raw_proto_hex = (
-        "080112960b0a0101100f3a0a0a04494443311a0242443a0a0a04494443321a0242443a0a0a0449444333"
-        "1a02424440014a0901090a0b1219202729580162a70a0a80013038464241333342343332324443323230"
-        "323033323030313232323130303031303038453030303330303841303032344235383634394234313330"
-        "324437423434363736323531343030303130343037653061306438343830653734386333663661613034"
-        "39643430303030303066663038306130353031636163666131366410c6011ab9037e585c541303054d51"
-        "000b5c545102560057050309525a0852070853030057550101545600000b051204014f7d5c4045491a05"
-        "1d04191009034c01567c77025a6842627e7a63494477675b79770e7708647b007c7c081302447b5d6351"
-        "74567c4f7f677f76565074744c5a7b515c5a5b515063450812535f5d4c1e63791d754541044c646a6640"
-        "014346504b594564134b7849470b6c7e7d5b466a1e46090d11040249085950785761007e7e45067e410f"
-        "5e0066567e427f520502734b000c130a494502601c5362621e6a0b71426f5a405343795a49197b1a5a48"
-        "40790c13034c197349517642174051597f5c6f4342435e5a030008644a05435c790e1b084c606973791e"
-        "40646217505d687b484c7f707a185269057943400005081302004d0700640a007370405d714943584261"
-        "057a6655016c70797c6a7f7c0c16034f701a015563610475431b015e0558670553401a5a037413771b66"
-        "000f160549564a7f50477b697304606c0541696876046346561e464a047f74750c1300054d4477051350"
-        "59437e5579435e65674a434500074a7b0240597c4f700d12054e5a4746597b5e5f5b704250405c1e6474"
-        "5041537b61451a08616a440522047b5f5d5d300c3a1a1101404b4202020201041511647b7163746e7c5b"
-        "57725d5550534207312e3133322e38480650015ab105036262535136334c707a475133416456324b796f"
-        "566c6646484e4861775a57523441737574496d41506233706a4666667465554a722b7a58592b466f2f43"
-        "2f58304b526636765a7631747943545a6e77314f7a307a7a554532636561556f61552b41483563492b42"
-        "4a6d4234556d654b54776f4c34656569657a5345536c79332b6a627163486b4f4156456a4b2b634c4776"
-        "3141652b68773749586f4e785137344d55716f544b4450557a4971564e584c4635337641775636706f68"
-        "4c47345738387a5132627739466773496a564a4b6a48397538796e55354f51305746632f434b764c2b6b"
-        "31617a2b6977576e34397044386c4b775253453846714b6d6c5061395963474e456b646d55562f55446d"
-        "643045334d74516c353230567a332b4c55754765344b5136653148336f69466f5647615058417a4a7547"
-        "4c6b62734a48412b537676504d4144416842676a502b364f6f49362b31445a594664644371736a675467"
-        "62436c5674555a466156726a3130617377584b793674436550373535396757444b65586c617074536949"
-        "5a73636d3376667051467165436252316c552f686639495163313634594d373553695a6765346979516c"
-        "36514933434571556e754a4b426e635855523739303635654951624674377773546b6f6737384552786e"
-        "6f4c484756392b59336662656d50316e4a3650385252394f673532587746706f3759646265556a685466"
-        "6c4c4c6a415a782b4a696375694a2f685234652f676c7674553533585849374a37346254377067776137"
-        "7054766a66514b696530516a79654b466f72794b6255354f46386771616a333464435961626933545470"
-        "4339435838326f36653462742f704a4a4458643855796a6757393075692b695a56434c70394477526173"
-        "7a6e7a567858654f37346174644138714956477943524239467145575a77384b755a536339593da20105"
-        "080310e802a201050804108703a201050805109c01a20105081d10cc01a2010408161076a20105080e10"
-        "8b01a201020815"
-    )
-    reg = str(region).upper() if region else "BD"
-    pkt_prefix = '0319' if reg == 'BD' else ('0314' if reg == 'IND' else '0315')
-
-    packet_bytes = bytes.fromhex(raw_proto_hex)
-    encrypted_packet = (await aes_encrypt(packet_bytes, key, iv)).hex()
-    packet_length = len(encrypted_packet) // 2
-    hex_length = f"{packet_length:08x}"
-    final_packet = pkt_prefix + hex_length + encrypted_packet
-    writer.write(bytes.fromhex(final_packet))
-    await writer.drain()
-
-
-# ==================== CS SQUAD FLOW (Type 1 + 9 + 11) ====================
-
-async def create_cs_squad(region, writer, key, iv):
-    """Create a CS squad (packet type 1) — required before matchmaking."""
-    reg = str(region).upper() if region else "BD"
-
-    field_14_1 = (
-        "088B823F4312D41B02010000000000080010000100070001D35A49B40F000000"
-        "4676251400000000000000000000000000000000000000ff00000000cacfa16d"
-    )
-
-    # 122-byte session blob — same prefix as solo blob
-    field_14_3 = bytes.fromhex(
-        "7E585C541303054D51000B5C545102560057050309525A085207085303005755010154560000"
-        "0B051204014F7D5C4045491A051D04191009034C01567C77025A6842627E7A63494477675B"
-        "79770E7708647B007C7C081302447B5D635174567C4F7F677F76565074744C5A7B515C5A5B"
-        "515063450812535F5D4C1E63791D754541044C646A6640014346504B594564134B7849470B"
-        "6C7E7D5B466A1E46090D11040249085950785761007E7E45067E410F5E0066567E427F5205"
-        "02734B000C130A494502601C5362621E6A0B71426F5A405343795A49197B1A5A4840790C13"
-        "034C197349517642174051597F5C6F4342435E5A030008644A05435C790E1B084C60697379"
-        "1E40646217505D687B484C7F707A185269057943400005081302004D0700640A007370405D"
-        "714943584261057A6655016C70797C6A7F7C0C16034F701A015563610475431B015E055867"
-        "0553401A5A037413771B66000F160549564A7F50477B697304606C0541696876046346561E"
-        "464A047F74750C1300054D447705135059437E5579435E65674A434500074A7B0240597C4F"
-        "700D12054E5A4746597B5E5F5B704250405C1E64745041537B61451A08616A4405"
-    )
-
-    fields = {
-        1: 1,
-        2: {
-            2: b"\x01",       # 🔥 FIX: was {} — real packet has 0x01 byte
-            3: 15,
-            4: 3,
-            5: "en",
-            8: [
-                {1: "IDC1", 3: reg},
-                {1: "IDC2", 3: reg},
-                {1: "IDC3", 3: reg},
-            ],
-            9: 1,
-            10: _Fixed64(2965374171695745545),
-            11: 1,
-            13: 1,
-            14: {
-                1: field_14_1,
-                2: len(field_14_3),
-                3: field_14_3,
-                4: b"{_]]",
-                6: 12,
-                7: {2: _Fixed64(72622752716767233)},
-                8: "1.132.8",
-                9: 6,
-                10: 1,
-                11: {},
-            },
-            19: 324,
-            21: b"\x01",
-            24: {1: 21},
-        },
-    }
-    pkt_type = '0519' if reg == 'BD' else ('0514' if reg == 'IND' else '0515')
-    proto_hex = (await _cs_build_proto(fields)).hex()
-    packet = await _cs_generate_packet(proto_hex, pkt_type, key, iv)
-    writer.write(packet)
-    await writer.drain()
-
-
-async def start_cs_squad_match(account_id, region, writer, key, iv):
-    """Start matchmaking inside the squad (packet type 9)."""
-    reg = str(region).upper() if region else "BD"
-    fields = {
-        1: 9,
-        2: {
-            1: int(account_id),
-            7: [
-                {1: "IDC1", 3: reg},
-                {1: "IDC2", 3: reg},
-                {1: "IDC3", 3: reg},
-            ],
-        },
-    }
-    pkt_type = '0519' if reg == 'BD' else ('0514' if reg == 'IND' else '0515')
-    proto_hex = (await _cs_build_proto(fields)).hex()
-    packet = await _cs_generate_packet(proto_hex, pkt_type, key, iv)
-    writer.write(packet)
-    await writer.drain()
-
-
-async def cancel_cs_squad_match(account_id, region, writer, key, iv):
-    """Cancel matchmaking (packet type 11)."""
-    reg = str(region).upper() if region else "BD"
-    fields = {
-        1: 11,
-        2: {
-            1: int(account_id),
-        },
-    }
-    pkt_type = '0519' if reg == 'BD' else ('0514' if reg == 'IND' else '0315'.replace('0','0'))  # careful
-    pkt_type = '0519' if reg == 'BD' else ('0514' if reg == 'IND' else '0515')
-    proto_hex = (await _cs_build_proto(fields)).hex()
-    packet = await _cs_generate_packet(proto_hex, pkt_type, key, iv)
-    writer.write(packet)
-    await writer.drain()
-
 
 async def has_ssan_zig(n):
     z = (n << 1) & 0xFFFFFFFFFFFFFFFF
@@ -1683,7 +1385,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 async def send_start_match():
                     nonlocal search_attempts, last_start_time
                     search_attempts += 1
-                    current_region = account_region or "BD"
+                    current_region = "BD"
                     print_info(f"[LONE WOLF] Sending StartMatch #{search_attempts} region: {current_region}")
                     try:
                         await asyncio.sleep(random.uniform(0.3, 0.6))
@@ -1691,14 +1393,14 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                             current_region, client_version, writer,
                             current_key, current_iv
                         )
-                        print_success(f"[LONE WOLF] StartMatch packet sent")
+                        print_success("[LONE WOLF] StartMatch packet sent")
                         active = await _get_match_count(uid_str)
                         try:
                             bot_state.update_status(uid_str, "SEARCHING", active)
                         except Exception:
                             pass
                     except Exception as e:
-                        print_error(f"[LONE WOLF] start_game error: {e}")
+                        print_error(f"start_game_lone_wolf error: {e}")
                     last_start_time = asyncio.get_running_loop().time()
 
                 await send_start_match()
@@ -1736,60 +1438,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     packet_length = len(data)
                     no_response_count = 0
 
-                    # 🔥 LOG EVERY INCOMING TCP PACKET + DECODED JSON
-                    print_colored(
-                        f"[TCP←RECV] len={packet_length} | head={hex_data[:40]}",
-                        Colors.CYAN
-                    )
-
-                    # Decode the protobuf payload (skip 5-byte header if starts with 0X00 pattern)
-                    decoded_json_str = None
-                    try:
-                        payload_hex = None
-                        if hex_data.startswith("0500") and packet_length >= 10:
-                            payload_hex = hex_data[10:]
-                        elif hex_data.startswith("0300") and packet_length >= 10:
-                            payload_hex = hex_data[10:]
-                        elif hex_data.startswith("0e00") and packet_length >= 10:
-                            payload_hex = hex_data[10:]
-                        elif hex_data.startswith("0f00") and packet_length >= 10:
-                            payload_hex = hex_data[10:]
-                        else:
-                            # No known header, try raw
-                            if packet_length < 5000:
-                                payload_hex = hex_data
-
-                        if payload_hex:
-                            decoded_json_str = await decode_protobuf(payload_hex)
-                            # Pretty-print if not too big
-                            if decoded_json_str and len(decoded_json_str) < 3000:
-                                try:
-                                    pretty = json.dumps(json.loads(decoded_json_str), indent=2)
-                                except Exception:
-                                    pretty = decoded_json_str
-                                print_colored(
-                                    f"[TCP←DECODED] {hex_data[:10]} →\n{pretty}\n",
-                                    Colors.GREEN
-                                )
-                                try:
-                                    bot_state.log(f"[TCP←] {hex_data[:10]} → {decoded_json_str[:400]}", "info", uid_str)
-                                except Exception:
-                                    pass
-                            else:
-                                print_warning(f"[TCP←DECODED] payload too large or decode failed (len={len(decoded_json_str) if decoded_json_str else 0})")
-                    except Exception as dec_e:
-                        print_warning(f"[TCP←DECODE ERROR] {dec_e}")
-
                     if hex_data.startswith("0300") and 10 < packet_length < 30:
-                        print_info(f"[TCP←RECV] Match Queue Confirmed (Header: {hex_data[:10]} | Len: {packet_length})")
-                        if decoded_json_str:
-                            print_colored(f"[TCP←STATUS] Decoded Response:\n{decoded_json_str}\n", Colors.GREEN)
+                        print_info("Match starting, please wait...")
                         continue
-
-                    if hex_data.startswith("0300") and packet_length >= 300:
-                        print_success(
-                            f"[TCP←RECV] 🎯 BIG PACKET! len={packet_length} | full_first_120={hex_data[:120]}"
-                        )
 
                     if hex_data.startswith("0300") and packet_length >= 300:
                         print_colored("=" * 60, Colors.GREEN)
@@ -2120,46 +1771,27 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
 
     print_info(f"[LOGIN] Full login for UID {uid}...")
     try:
-        print_info(f"[STEP 1/4] Fetching version config...")
         verconfig_res = await version_config()
         if verconfig_res is None:
-            print_error(f"[STEP 1/4] FAILED → version_config() returned None")
             return None
-        release_version, remote_version, server_url = verconfig_res
-        # 🔥 FIX: use remote_version (matches map blob 14.8) instead of Play Store version
-        client_version = remote_version or "1.132.8"
-        print_info(f"[STEP 1/4] Using client_version={client_version} (remote_version for map-blob consistency)")
-        print_success(f"[STEP 1/4] OK → release={release_version} | client={client_version} | server={server_url}")
+        release_version, client_version, server_url = verconfig_res
         
-        print_info(f"[STEP 2/4] Guest OAuth token grant for UID {uid}...")
         tokengrant_response = await get_access_token(uid, password)
         if tokengrant_response is None:
-            print_error(f"[STEP 2/4] FAILED → get_access_token() returned None (check OAUTH debug above)")
             return None
         open_id, access_token, platform = tokengrant_response
-        print_success(f"[STEP 2/4] OK → open_id={open_id[:12]}... | platform={platform}")
         
         # 🔥 1ta id 1ta Device Injection
         device_info = get_device_for_account(uid)
         
-        print_info(f"[STEP 3/4] Building MajorLogin payload + POST...")
         login_payload_data = await build_majorlogin_payload(open_id, access_token, platform, client_version, device_info)
-        if login_payload_data is None:
-            print_error(f"[STEP 3/4] FAILED → build_majorlogin_payload() returned None")
-            return None
         majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url)
         if majorlogin_response is None:
-            print_error(f"[STEP 3/4] FAILED → send_majorlogin() returned None (check MAJORLOGIN debug above)")
             return None
-        print_success(f"[STEP 3/4] OK → account_id={majorlogin_response.account_id} | region={majorlogin_response.region}")
-        
-        print_info(f"[STEP 4/4] Fetching login data (GetLoginData)...")
         getlogin_result = await send_getlogin(login_payload_data, majorlogin_response.url, majorlogin_response.token, release_version)
         if getlogin_result is None:
-            print_error(f"[STEP 4/4] FAILED → send_getlogin() returned None (check GETLOGIN debug above)")
             return None
         res_proto, dict_res = getlogin_result
-        print_success(f"[STEP 4/4] OK → nickname={res_proto.nickname}")
 
         acc_id = str(majorlogin_response.account_id)
         level = int(get_proto_field(dict_res, 6, 1))
@@ -2403,93 +2035,6 @@ async def account_loop_guest(uid: str, password: str):
                 await asyncio.sleep(15)
                 continue
 
-            # ============================================================
-            # 🔥 EXP-BASED ROUTING
-            #   Level 2 (48 <= exp < 202)  →  Play ONE Clash Squad match first
-            #   Level 3+ (exp >= 202)      →  Run Lone Wolf (existing behavior)
-            # ============================================================
-            acc_id = str(account_data.get('account_id', uid))
-
-            # Prefer bot_state (freshest) over cached account_data
-            if acc_id in bot_state.accounts:
-                current_exp = int(bot_state.accounts[acc_id].get('current_exp') or account_data.get('exp', 0) or 0)
-                current_level = int(bot_state.accounts[acc_id].get('level') or account_data.get('level', 1) or 1)
-            else:
-                current_exp = int(account_data.get('exp', 0) or 0)
-                current_level = int(account_data.get('level', 1) or 1)
-
-            if 48 <= current_exp < 202:
-                print_warning(
-                    f"[ROUTING] UID {uid} | Level {current_level} | exp={current_exp} "
-                    f"→ Delegating to CS Engine (cs.py)..."
-                )
-                try:
-                    bot_state.update_status(acc_id, "CS_ENGINE", 1)
-                except Exception:
-                    pass
-
-                # 🔥 Run cs.py as Subprocess Engine
-                try:
-                    sub_env = os.environ.copy()
-                    sub_env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-                    cs_engine_path = os.path.join(SCRIPT_DIR, "cs.py")
-                    if not os.path.isfile(cs_engine_path):
-                        raise FileNotFoundError(f"cs.py not found at {cs_engine_path}")
-                    proc = await asyncio.create_subprocess_exec(
-                        sys.executable, cs_engine_path, str(uid), str(password),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        env=sub_env,
-                        cwd=SCRIPT_DIR
-                    )
-                    
-                    # Stream cs.py logs in real-time
-                    while True:
-                        line = await proc.stdout.readline()
-                        if not line:
-                            break
-                        log_msg = line.decode('utf-8', errors='replace').strip()
-                        if log_msg:
-                            print_colored(f"[CS-ENGINE:{uid}] {log_msg}", Colors.CYAN)
-                            bot_state.log(log_msg, "info", acc_id)
-                            
-                    await proc.wait()
-                    print_success(f"[CS-ENGINE:{uid}] Process finished with code: {proc.returncode}")
-                except Exception as e:
-                    print_error(f"[CS-ENGINE] Subprocess execution error: {e}")
-                    bot_state.log(f"CS Engine failed to start: {e}", "error", acc_id)
-
-                # Refresh profile to pick up newly earned EXP
-                print_info(f"[ROUTING] Refreshing profile for {uid} after CS Engine match...")
-                await asyncio.sleep(3)
-                try:
-                    await refresh_account_profile(account_data)
-                except Exception as e:
-                    print_error(f"[ROUTING] Profile refresh error: {e}")
-
-                # Read fresh EXP
-                if acc_id in bot_state.accounts:
-                    current_exp = int(bot_state.accounts[acc_id].get('current_exp') or current_exp)
-                    current_level = int(bot_state.accounts[acc_id].get('level') or current_level)
-
-                if current_exp >= 202:
-                    print_success(
-                        f"[ROUTING] 🎉 UID {uid} leveled up! Level {current_level} | exp={current_exp} "
-                        f"→ Switching to Lone Wolf mode."
-                    )
-                    account_data['exp'] = current_exp
-                    account_data['level'] = current_level
-                    cache_set(str(uid), account_data)
-                else:
-                    print_warning(
-                        f"[ROUTING] UID {uid} still Level {current_level} | exp={current_exp} (<202). "
-                        f"Retrying CS Engine in 5 seconds..."
-                    )
-                    cache_invalidate(str(uid))
-                    await asyncio.sleep(5)
-                    continue
-
-            # ---- Lone Wolf mode (pure LW engine) ----
             await run_account_worker(account_data, uid)
             print_warning(f"Session finished for {uid}. Reconnecting in 3s...")
             await asyncio.sleep(3)
